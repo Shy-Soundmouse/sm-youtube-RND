@@ -1,0 +1,861 @@
+import os
+import threading
+
+import pika
+import json
+import time
+import boto3
+import zipfile
+import shutil
+import ast
+import glob
+import traceback
+import csv
+import functools
+import requests
+
+from tqdm import tqdm
+
+session = boto3.Session(
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_KEY'),
+)
+s3 = session.resource('s3')
+
+ARCHIVE_BUCKET = os.getenv('ARCHIVE_BUCKET')
+BUCKET = os.getenv('BUCKET')
+PROJECT = os.getenv('PROJECT')
+EXCHANGE = os.getenv('RABBIT_EXCHANGE')
+IDS_KEY = os.getenv('IDS_KEY')
+FINISHED_LATEST_KEY = os.getenv('FINISHED_LATEST_KEY')
+
+TEMP_REPORT_ZIP_FILENAME = 'temp_report.csv.zip'
+TEMP_REPORT_CSV_FILENAME = 'temp_report.csv'
+
+NUM_TRACKS = os.getenv('NUM_TRACKS')
+
+RABBIT_HOST = os.getenv('RABBIT_HOST')
+RABBIT_CREDENTIALS = pika.PlainCredentials(username=os.getenv('RABBIT_USER'), password=os.getenv('RABBIT_PWD'))
+
+DEFAULT_THINNING = os.getenv("DEFAULT_THINNING", 10)
+
+USE_CONTENT_RECOGNITION = os.getenv('USE_CONTENT_RECOGNITION', 'false').lower() == 'true'
+CONTENT_RECOGNITION_URL = "https://content-recognition-api.orfium.com/api/v1/search/"
+CONTENT_RECOGNITION_SECRET = os.getenv("CONTENT_RECOGNITION_SECRET", '')
+FINGERPRINTS_QUARTER = os.getenv("FINGERPRINTS_QUARTER")
+DOWNLOAD_BUCKET = os.getenv("DOWNLOAD_BUCKET")
+
+
+class SoundcloudReportDialect(csv.Dialect):
+    delimiter = ','
+    quotechar = '"'
+    # escapechar = '"'
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = '\n'
+    quoting = csv.QUOTE_MINIMAL
+
+
+class YoutubeSourceReportDialect(csv.Dialect):
+    delimiter = ','
+    quotechar = '"'
+    # escapechar = '\\'
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = '\n'
+    quoting = csv.QUOTE_MINIMAL
+
+
+class JasracDialect(csv.Dialect):
+    delimiter = ','
+    quotechar = '"'
+    # escapechar = '\\'
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = '\n'
+    quoting = csv.QUOTE_MINIMAL
+
+
+def get_values(body):
+    body = ast.literal_eval(body)
+    if "key" not in body.keys():
+        raise RuntimeError("key not found in request")
+    key = body["key"]
+    return key
+
+
+def download(key, bucket=ARCHIVE_BUCKET, s3_resource=s3, filename=TEMP_REPORT_CSV_FILENAME):
+    try:
+        ext = key.split(".")[-1]
+        if ext == "zip":
+            s3_resource.Bucket(bucket).download_file(key, TEMP_REPORT_ZIP_FILENAME)
+        else:
+            from boto3.s3.transfer import TransferConfig
+            config = TransferConfig(multipart_threshold=1024 * 1024,
+                                    max_concurrency=10,
+                                    multipart_chunksize=1024 * 1024,
+                                    use_threads=True)
+            s3_resource.Object(bucket, key).download_file(filename, Config=config)
+    except Exception as e:
+        traceback.print_exc()
+        raise e
+    return os.path.join(os.getcwd(), filename)
+
+
+def unzip(dl_file):
+    temp_dirname = "temp"
+
+    # Make sure temp directory exists and is clean.
+    if os.path.exists(temp_dirname):
+        shutil.rmtree(temp_dirname)
+    os.makedirs(temp_dirname)
+
+    if dl_file.split(".")[-1] == "zip":
+        # If zip file, then unzip into temp directory.
+        print("A zip file has been detected.")
+        try:
+            zip_ref = zipfile.ZipFile(dl_file, 'r')
+            zip_ref.extractall(temp_dirname)
+            zip_ref.close()
+        except Exception as e:
+            traceback.print_exc()
+            raise e
+    else:
+        # If csv file, then just move into temp directory.
+        print("A simple csv (unzipped) has been detected.")
+        try:
+            shutil.move(
+                dl_file,
+                os.path.join(temp_dirname, os.path.basename(dl_file))
+            )
+            print(f"move to {temp_dirname}")
+        except Exception as e:
+            traceback.print_exc()
+            raise e
+    return True
+
+
+def get_download_targets_youtube_list(report_file):
+    targets = []
+    ids = []
+
+    with open(report_file, "rb") as fhandle:
+        lines = fhandle.readlines()
+
+    for i, line in tqdm(enumerate(lines[0:])):
+        line = line.decode("utf-8")
+        id = line.strip()
+        ids.append(id)
+
+    for id in ids:
+        target_dict = {
+            "id": id,
+            "url": "NA"
+        }
+        targets.append(target_dict)
+
+    return targets
+
+
+def get_download_targets_youtube(report_file, previous_ids):
+    sorted_plays, total_views = sort_targets_youtube(previous_ids, report_file)
+    views = 0
+    targets = []
+    for item in sorted_plays[:int(NUM_TRACKS)]:
+        views += item[1]
+        target_dict = {
+            "id": item[0],
+            "url": "NA",
+            "thinning": get_thinning(views, total_views)
+        }
+        targets.append(target_dict)
+
+    return targets
+
+
+def sort_targets_youtube(previous_ids, report_file):
+    views_dict = dict()
+    with open(report_file, 'r', encoding='utf8') as filehandle:
+        dialect = YoutubeSourceReportDialect()
+        reader = csv.DictReader(filehandle, dialect=dialect)
+
+        for i, row in enumerate(reader):
+            video_id = row['Video ID']
+            views = row['Views']
+            if video_id in views_dict:
+                try:
+                    views_dict[video_id] += int(views)
+                except Exception as e:
+                    print("WARNING! Problem with row: ", row['Video ID'])
+                    traceback.print_exc()
+            else:
+                try:
+                    views_dict[video_id] = int(views)
+                except Exception as e:
+                    print("WARNING! Problem with row: ", row['Video ID'])
+                    traceback.print_exc()
+    # Remove any previously processed video ids
+    for id in list(views_dict):
+        if id in previous_ids:
+            del views_dict[id]
+    # Sort the views_dict in descending order
+    import operator
+    sorted_plays = sorted(views_dict.items(), key=operator.itemgetter(1))
+    sorted_plays.reverse()
+    # (top 50,000 most viewed video that have not
+    # already been processed)
+    total_views = (sum([plays for _, plays in sorted_plays[:int(NUM_TRACKS)]]))
+    return sorted_plays, total_views
+
+
+def get_thinning(views, total_views):
+    # At thinning 10, this will essentially still do most of the videos at thinning 10,
+    # but will do some at thinning 1, some at 2, etc...
+    return max(1,int(DEFAULT_THINNING * views / total_views))
+
+
+def get_download_targets_bmi(report_file, previous_ids):
+    targets = []
+    views_dict = dict()
+
+    with open(report_file, 'r', encoding='utf8') as filehandle:
+        dialect = YoutubeSourceReportDialect()
+        reader = csv.DictReader(filehandle, dialect=dialect)
+
+        for i, row in enumerate(reader):
+            video_id = row['VIDEO_ID']
+            views = row['VIEW_COUNT']
+            if video_id in views_dict:
+                views_dict[video_id] += int(float(views))
+            else:
+                views_dict[video_id] = int(float(views))
+
+    # Remove any previously processed video ids
+    views_dict = {key: views_dict[key] for key in set(views_dict) - set(previous_ids)}
+
+    # Sort the views_dict in descending order
+    import operator
+    sorted_plays = sorted(views_dict.items(), key=operator.itemgetter(1))
+    sorted_plays.reverse()
+
+    # Find pertinent download targets (for BMI we want all)
+    for item in sorted_plays:
+        target_dict = {
+            "id": item[0],
+            "url": "NA"
+        }
+        targets.append(target_dict)
+
+    return targets
+
+
+def get_download_targets_nfl(report_file, previous_ids):
+    targets = []
+    views_dict = dict()
+
+    with open(report_file, 'r', encoding='utf8') as filehandle:
+        print(filehandle)
+        dialect = YoutubeSourceReportDialect()
+        reader = csv.DictReader(filehandle, dialect=dialect)
+
+        for i, row in enumerate(reader):
+            video_id = row['video_id']
+            views = row['views']
+            if video_id in views_dict:
+                views_dict[video_id] += int(float(views))
+            else:
+                views_dict[video_id] = int(float(views))
+
+    # Remove any previously processed video ids
+    views_dict = {key: views_dict[key] for key in set(views_dict) - set(previous_ids)}
+
+    # Sort the views_dict in descending order
+    import operator
+    sorted_plays = sorted(views_dict.items(), key=operator.itemgetter(1))
+    sorted_plays.reverse()
+
+    # Find pertinent download targets (for BMI we want all)
+    for item in sorted_plays:
+        target_dict = {
+            "id": item[0],
+            "url": "NA"
+        }
+        targets.append(target_dict)
+
+    return targets
+
+
+def get_download_targets_soundcloud(report_file, previous_ids):
+    targets = []
+
+    # Read all IDs into a list of dicts with track_id and url
+    with open(report_file, 'r', encoding='utf-8') as filehandle:
+        dialect = SoundcloudReportDialect()
+        reader = csv.DictReader((line.replace('\0', '') for line in filehandle), dialect=dialect)
+
+        for i, row in enumerate(reader):
+            try:
+                track_id = str(row['track_id'])
+                signed_url = row['url']
+            except Exception as e:
+                print("PROBLEM LINE: ", row['track_id'], row['url'])
+                traceback.print_exc()
+                raise e
+
+            targets.append({'id': track_id, 'url': signed_url})
+
+    # Remove any previously processed video ids
+    # Do this as a dict because it takes too long otherwise
+    previous_ids_dict = {prev_id: True for prev_id in previous_ids}
+
+    for target in targets[:]:
+        if previous_ids_dict.get(target['id'], False):
+            targets.remove(target)
+
+    return targets
+
+# Jasrac is sorted by revenue
+def get_download_targets_jasrac(report_file, previous_ids, number_tracks):
+    targets = []
+    views_dict = dict()
+
+    with open(report_file, 'r', encoding='utf8') as filehandle:
+        dialect = JasracDialect()
+        reader = csv.DictReader(filehandle, dialect=dialect)
+        count_error=0
+        for i, row in enumerate(reader):
+            video_id = row['Video_ID']
+            revenue = row['Gross_Revenue']
+            if video_id == '' and revenue == '': # empty line skip
+                continue
+            elif len(video_id) >= 20 or len(video_id) < 9:
+                continue
+            try:
+                revenue = int(float(revenue))
+            except Exception:
+                count_error+=1
+                print(f"row:{row}")
+                continue
+
+            if revenue < 2:
+                continue
+
+            if video_id in views_dict:
+                try:
+                    views_dict[video_id] += revenue
+                except ValueError:
+                    print(f"ValueError: can't parse {revenue} into number for {video_id}")
+                    pass
+                except Exception as e:
+                    print("WARNING! Problem with row: ", row['Video ID'])
+                    traceback.print_exc()
+            else:
+                try:
+                    views_dict[video_id] = revenue
+                except ValueError:
+                    print(f"ValueError: can't parse {revenue} into number for {video_id}")
+                    pass
+                except Exception as e:
+                    print("WARNING! Problem with row: ", row['Video ID'])
+                    traceback.print_exc()
+
+    print(f"total error:{count_error}")
+
+    # Remove any previously processed video ids
+    for id in list(views_dict):
+        if id in previous_ids:
+            del views_dict[id]
+
+    # Sort the views_dict in descending order
+    import operator
+    sorted_plays = sorted(views_dict.items(), key=operator.itemgetter(1))
+    sorted_plays.reverse()
+    revenue = 0
+    total_revenue = (sum([plays for _, plays in sorted_plays[:int(number_tracks)]]))
+    for item in sorted_plays[:int(number_tracks)]:
+        revenue += item[1]
+        target_dict = {
+            "id": item[0],
+            "url": "NA",
+            "thinning": 1
+        }
+        targets.append(target_dict)
+
+    return targets
+
+def get_download_targets_komca(report_file, previous_ids, number_tracks):
+    targets = []
+    sorted_plays = []
+    # todo implement sorting and extracting method when we have the report format
+    raise NotImplementedError
+
+def is_video_in_S3(video_id, bucket=DOWNLOAD_BUCKET, s3_resource=s3):
+    try:
+        s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.m4a").load()
+        return True
+    except Exception as e:
+        # could also be mp4
+        try:
+            s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.mp4").load()
+            return True
+        except Exception as e:
+            return False
+
+def send_content_recognition_request(video_id: str):
+    url = CONTENT_RECOGNITION_URL
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Secret {CONTENT_RECOGNITION_SECRET}"
+    }
+    body = {
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "media_type": "AUDIO",
+        "destination_path_suffix": f"{PROJECT}/{FINGERPRINTS_QUARTER}"
+    }
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=60)
+        return response
+    except requests.exceptions.Timeout:
+        print(f"Timeout occurred for video {video_id}")
+        return None
+    except requests.exceptions.SSLError as e:
+        print(f"SSL error occurred for video {video_id}: {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Request error occurred for video {video_id}: {e}")
+        return None
+    except Exception as e:
+        print(f"An error occurred for video {video_id}: {e}")
+        return None
+
+
+
+def send_content_recognition_requests(targets: list[dict[str, any]]):
+    index = 0  # to track progress in the case of rate limits
+    with tqdm(total=len(targets), desc="Sending download requests") as pbar:
+        while index < len(targets):
+            video_id = targets[index]["id"]
+            pbar.set_postfix_str(f"Video ID: {video_id}")
+            if is_video_in_S3(video_id):
+                print(f"Video {video_id} already in the CRS bucket. Skipped.")
+            else:
+                response = send_content_recognition_request(video_id)
+                if not response or response.status_code != 201:
+                    if not response:
+                        print("An exception occurred on CRS, pausing for an hour")
+                        time.sleep(3600)  # Pause for an hour, CRS mostly recovers in 20 minutes
+                        continue
+                    if "Max quota reached" in response.text:
+                        print("Max quota reached, pausing for an hour...")
+                        time.sleep(3600)  # Pause for an hour
+                        continue
+                    else:
+                        print(f"Error processing video {video_id}: {response.text}")
+            index += 1
+            pbar.update(1)
+def sort_report(project="", previous_ids=[], test_csv=False):
+    # If 'test_csv' is True, we are in unit-testing mode.
+    if test_csv is False:
+        # File whatever files are present in temp/ directory.
+        files = glob.glob1("temp", "*.csv")
+        if len(files) != 1:
+            print("ERROR: There must be exactly 1 file but found ", len(files), " instead!")
+            raise RuntimeError('There must be exactly 1 csv file.')
+    else:
+        # We are unit testing.
+        files = glob.glob1("temp", test_csv)
+    report_file = os.path.join("temp", files[0])
+
+    # Get download targets.
+    if project == 'youtube_catchup':
+        targets = get_download_targets_youtube_list(report_file)
+    elif project == 'korea':
+        targets = get_download_targets_youtube_list(report_file)
+    elif project == 'youtube':
+        targets = get_download_targets_youtube(report_file, previous_ids)
+    elif project == 'soundcloud':
+        targets = get_download_targets_soundcloud(report_file, previous_ids)
+    elif project == 'bmi':
+        targets = get_download_targets_bmi(report_file, previous_ids)
+    elif project == 'nfl':
+        targets = get_download_targets_nfl(report_file, previous_ids)
+    elif project == 'sacem-rfp':
+        # file get prefiltered for the rfp, so process everything in the file
+        targets = get_download_targets_youtube(report_file, previous_ids=set())
+    elif project == 'jasrac':
+        targets = get_download_targets_jasrac(report_file, previous_ids, number_tracks=NUM_TRACKS)
+    elif project == 'komca':
+        targets = get_download_targets_komca(report_file, previous_ids, number_tracks=NUM_TRACKS)
+    else:
+        print("ERROR: Unknown project specified: ", project, "\n")
+        return False
+
+    return targets
+
+
+def get_previous_ids(bucket=BUCKET, s3_resource=s3):
+    # Get ids_key basename to handle cases where S3 'directories' are used.
+    processed_id_files = list()
+    for object in s3_resource.Bucket(bucket).objects.filter(Prefix='processed_id_lists'):
+        try:
+            file_basename = object.key.split('/')[-1]
+            s3_resource.Bucket(bucket).download_file(object.key, file_basename)
+            processed_id_files.append(file_basename)
+        except Exception as e:
+            print("Error trying to download {} from bucket {}".format(object.key, bucket))
+            traceback.print_exc()
+            raise e
+
+    processed_ids = set()
+    for file in processed_id_files:
+        with open(file, 'r') as f:
+            processed_ids.update({id.replace('\n', "").strip().split(",")[0] for id in f.readlines()})
+
+    for file in processed_id_files:
+        os.remove(file)
+
+    print("Number of asset IDs from {} processed id files : {}".format(
+        len(processed_id_files), len(processed_ids)))
+    try:
+        print("Sample first 10 IDs: ", list(processed_ids)[:10])
+    except Exception as e:
+        traceback.print_exc()
+        print("processed id files appears empty.")
+
+    return processed_ids
+
+
+def get_finished_ids(bucket=ARCHIVE_BUCKET, s3_resource=s3):
+    """
+    Sample of FINISHED_LATEST_KEY file:
+
+    /media/monster24/joshua_tsang/youtube_2020q1_split/0_/0_PNEasqJdk.zqsi
+    /media/monster24/joshua_tsang/youtube_2020q1_split/0_/0_X2GHaKhg8.zqsi
+    /media/monster24/joshua_tsang/youtube_2020q1_split/0_/0_PJx6SrhSM.zqsi
+
+    The output of this function are the asset ids i.e. 0_PNEasqJdk, 0_X2GHaKhg8 and 0_PJx6SrhSM
+    """
+
+    # Soundcloud doesn't make use of this functionality since there are no duplicate tracks to download
+    if 'soundcloud' in PROJECT.lower() or 'sacem-rfp' in PROJECT.lower():
+        return set()
+
+    finished_ids_basename = FINISHED_LATEST_KEY.split('/')[-1]
+
+    try:
+        s3_resource.Bucket(bucket).download_file(
+            FINISHED_LATEST_KEY,
+            finished_ids_basename
+        )
+
+        print("Cannot find file [", FINISHED_LATEST_KEY, "] in S3 bucket [", bucket, "].")
+    except Exception as e:
+        traceback.print_exc()
+        raise e
+
+    with open(finished_ids_basename) as f:
+        lines = f.readlines()
+    finished_ids = set()
+
+    for l in lines:
+        finished_ids.add(l.split('/')[-1].replace('.zqsi', '').replace('.meta', '').strip())
+    os.remove(finished_ids_basename)
+
+    print("Number of asset IDs from '%s': %s" % (finished_ids_basename, len(finished_ids)))
+    try:
+        print("'%s' sampled ID: %s" % (finished_ids_basename, list(finished_ids)[0]))
+    except Exception as e:
+        traceback.print_exc()
+        print("'%s' appears empty." % finished_ids_basename)
+
+    return finished_ids
+
+
+def ack_message(channel, delivery_tag):
+    if channel.is_open:
+        channel.basic_ack(delivery_tag)
+    else:
+        print(f"ERROR: Cannot ack message. Channel is already closed.")
+
+
+def publish_message(channel, message):
+    if channel.is_open:
+        channel.basic_publish(exchange=EXCHANGE,
+                              routing_key='download-request',
+                              properties=pika.BasicProperties(
+                                  delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+                              ),
+                              body=json.dumps(message))
+    else:
+        print(f"ERROR: Cannot publish message {message} to download-request. Channel is already closed.")
+
+
+def write_new_previous_ids(targets, bucket=BUCKET, s3_resource=s3):
+    print('Getting list of processed_ids to write new file....')
+    try:
+        processed_ids = get_previous_ids(bucket=bucket, s3_resource=s3_resource)
+    except Exception as e:
+        print("ERROR: Cannot retrieve previous_ids for writing an updated set.")
+        raise e
+
+    for item in targets:
+        id = item["id"]
+        processed_ids.add(id)
+
+    print('Writing new processed_ids file...')
+    processed_ids_temp_filename = "processed_ids_temp.txt"
+    with open(processed_ids_temp_filename, "w") as f:
+        for id in processed_ids:
+            f.write("%s\n" % id)
+
+    # Write the new file to the bucket with 'processed_id_lists' prefix
+    current_processed_ids_key = f'processed_id_lists/{IDS_KEY}'
+    print('Uploading new processed_ids file {}'.format(current_processed_ids_key))
+    s3_resource.Bucket(bucket).upload_file(processed_ids_temp_filename, current_processed_ids_key)
+
+    os.remove(processed_ids_temp_filename)
+    del processed_ids
+    return True
+
+
+def on_message(channel, method_frame, header_frame, body, args):
+    (connection, threads) = args
+    if PROJECT == 'youtube':
+        t = threading.Thread(target=process_youtube_job, args=(connection, channel, method_frame.delivery_tag, body))
+    else:
+        t = threading.Thread(target=process_job, args=(connection, channel, method_frame.delivery_tag, body))
+    t.start()
+    threads.append(t)
+
+
+def clean_up(dl_file):
+    if os.path.isdir(dl_file):
+        shutil.rmtree(dl_file)
+
+    if os.path.isfile(dl_file):
+        os.remove(dl_file)
+
+
+def process_job(connection: pika.BlockingConnection, channel, delivery_tag, body):
+    key = get_values(body.decode("utf-8"))
+    print("key: ", key)
+
+    # Download the report
+    print("Downloading...")
+    try:
+        report_path = download(key)
+        print("Report Downloaded to: ", report_path)
+    except Exception as e:
+        traceback.print_exc()
+        return True
+
+    # Unzip the report
+    print("Unzipping (if it is a zip file)...")
+    try:
+        unzip(report_path)
+    except Exception as e:
+        traceback.print_exc()
+        return True
+
+    # Get list of previously processed ids.
+    print("Getting previous ids...")
+    try:
+        previous_ids = get_previous_ids(bucket=BUCKET, s3_resource=s3)
+    except Exception as e:
+        print("ERROR: Cannot retrieve previous_ids.")
+        traceback.print_exc()
+        raise e
+
+    # Get qualifying media ids
+    print("Sorting report...")
+    targets = []
+    try:
+        targets = sort_report(project=PROJECT, previous_ids=previous_ids)
+        print("Number of videos fitting criteria: ", len(targets))
+        if USE_CONTENT_RECOGNITION:
+            send_content_recognition_requests(targets)
+    except Exception as e:
+        print("ERROR: Failed to run sorting.\n %s" % e)
+        # # Ack and send to report-failed
+        connection2 = pika.BlockingConnection(
+            pika.ConnectionParameters(host=os.getenv('RABBIT_HOST'), port=5672, credentials=RABBIT_CREDENTIALS))
+
+        connection2.channel().basic_publish(exchange=EXCHANGE,
+                              routing_key='report-failed',
+                              properties=pika.BasicProperties(
+                                  delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+                              ),
+                              body=json.dumps({"key": key,
+                                               "error": f"Failed to run sorting.{e}"
+                                               }))
+
+        # Clean up
+        clean_up(report_path)
+        ack_callback = functools.partial(ack_message, channel, delivery_tag)
+        connection.add_callback_threadsafe(ack_callback)
+        return False
+
+    # Get finished ids
+    print("Constructing download ignore lists...")
+    try:
+        finished_ids = get_finished_ids()
+    except Exception as e:
+        print("ERROR: Missing finished_ids_X file.\n %s" % e)
+        return False
+
+    # Publish messages for download consumer.
+    print("Publishing...")
+    publish_download_request(channel, connection, finished_ids, targets)
+    del finished_ids
+    del previous_ids
+
+    # Add these to the processed_ids file
+    try:
+        if len(targets) > 0:
+            write_new_previous_ids(targets)
+    except Exception as e:
+        print("ERROR: Cannot write new previous_ids.\n %s" % e)
+        return False
+
+    # Clean up
+    clean_up(report_path)
+
+    # Ack the message in the main thread via a callback given to connection
+    ack_callback = functools.partial(ack_message, channel, delivery_tag)
+    connection.add_callback_threadsafe(ack_callback)
+
+
+def publish_download_request(channel, connection, finished_ids, targets):
+    targets_list = set()
+    num_messages = 0
+    for item in targets:
+        id = item['id']
+        if id not in finished_ids:
+            targets_list.add(id)
+            num_messages += 1
+            # publish messages in the main thread via a callback given to connection
+            publish_callback = functools.partial(publish_message, channel, item)
+            connection.add_callback_threadsafe(publish_callback)
+    print("Number of messages published = ", num_messages)
+    return targets_list
+
+
+ICE_YOUTUBE_COUNTRY_CODE = os.getenv('ICE_YOUTUBE_COUNTRY_CODE', 'GB,DE,ID,IN,ZA,AT,SE,BE,NL,ES,IT,FR').split(',')
+
+def check_all_youtube_report_downloaded(regions, file_names):
+    for region in regions:
+        if region not in str(file_names):
+            return False
+    return True
+
+def process_youtube_job(connection: pika.BlockingConnection, channel, delivery_tag, body):
+    # create folder
+    folder = 'reports'
+    os.makedirs(folder, exist_ok=True)
+
+    # download all reports and preprocess
+    key = get_values(body.decode("utf-8"))
+    print("key: ", key)
+    report_path = download(key, filename=f'{folder}/{key.split("/")[-1]}')
+    print("Report Downloaded to: ", report_path)
+
+    files = glob.glob1(folder, "*.csv")
+    files = [f'{folder}/{file}' for file in files]
+
+    if check_all_youtube_report_downloaded(ICE_YOUTUBE_COUNTRY_CODE, files):
+        print("regions file arrived")
+        # Get list of previously processed ids.
+        print("Getting previous ids...")
+        previous_ids = get_previous_ids(bucket=BUCKET, s3_resource=s3)
+
+        region_view_counts = {}
+        for report_file in files:
+            print(report_file)
+            sorted_plays, total_views = sort_targets_youtube(previous_ids, report_file)
+            region_view_counts[report_file] = total_views
+
+        print(region_view_counts)
+        sorted_report_file = sorted(region_view_counts, key=region_view_counts.get)
+        print(sorted_report_file)
+
+        for report_file in sorted_report_file:
+            print("Getting previous ids...")
+            previous_ids = get_previous_ids(bucket=BUCKET, s3_resource=s3)
+            targets = get_download_targets_youtube(report_file, previous_ids)
+            if USE_CONTENT_RECOGNITION:
+                send_content_recognition_requests(targets)
+            print("Publishing...")
+            publish_download_request(channel, connection, [], targets)
+
+            if len(targets) > 0:
+                write_new_previous_ids(targets)
+
+        clean_up(folder)
+    else:
+        print(f"regions file not arrive, {files}")
+
+    # Ack the message in the main thread via a callback given to connection
+    ack_callback = functools.partial(ack_message, channel, delivery_tag)
+    connection.add_callback_threadsafe(ack_callback)
+
+
+
+def consume():
+    channel = connection = None
+    threads = []
+    try:
+        print("connecting")
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(
+                host=RABBIT_HOST,
+                port=5672,
+                heartbeat=0, # deactivate heartbeat
+                credentials=RABBIT_CREDENTIALS
+            )
+        )
+        channel = connection.channel()
+        print("consuming")
+
+        report_created_queue_name = '.'.join([EXCHANGE, 'report-created'])
+        print("Going to consume from queue: ", report_created_queue_name)
+
+        channel.basic_qos(prefetch_count=1)
+        on_message_callback = functools.partial(on_message, args=(connection, threads))
+        channel.basic_consume(report_created_queue_name, on_message_callback)
+        channel.start_consuming()
+
+    except KeyboardInterrupt:
+        try:
+            channel.stop_consuming()
+        except Exception as e:
+            traceback.print_exc()
+            print("Error stopping channel consumer")
+    except Exception as e:
+        traceback.print_exc()
+        if channel is not None:
+            try:
+                channel.stop_consuming()
+            except Exception as e:
+                traceback.print_exc()
+                print("Error stopping channel consumer")
+
+    for thread in threads:
+        thread.join()
+
+    if connection:
+        connection.close()
+
+# pragma: no cover
+if __name__ == "__main__":
+    print(f'ARCHIVE_BUCKET : {ARCHIVE_BUCKET}')
+    print(f'BUCKET : {BUCKET}')
+    print(f'PROJECT : {PROJECT}')
+    print(f'EXCHANGE : {EXCHANGE}')
+    print(f'IDS_KEY : {IDS_KEY}')
+    print(f'FINISHED_LATEST_KEY : {FINISHED_LATEST_KEY}')
+    print(f'NUM_TRACKS : {NUM_TRACKS}')
+    print(f'RABBIT_HOST : {RABBIT_HOST}')
+    while True:
+        consume()
+        time.sleep(5)
