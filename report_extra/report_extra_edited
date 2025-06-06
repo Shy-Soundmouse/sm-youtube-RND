@@ -40,8 +40,8 @@ RABBIT_CREDENTIALS = pika.PlainCredentials(username=os.getenv('RABBIT_USER'), pa
 DEFAULT_THINNING = os.getenv("DEFAULT_THINNING", 10)
 
 USE_CONTENT_RECOGNITION = os.getenv('USE_CONTENT_RECOGNITION', 'false').lower() == 'true'
-CONTENT_RECOGNITION_URL = "https://content-recognition-api.orfium.com/api/v1/search/"
-CONTENT_RECOGNITION_SECRET = os.getenv("CONTENT_RECOGNITION_SECRET", '')
+# CONTENT_RECOGNITION_URL = "https://content-recognition-api.orfium.com/api/v1/search/"
+# CONTENT_RECOGNITION_SECRET = os.getenv("CONTENT_RECOGNITION_SECRET", '')
 FINGERPRINTS_QUARTER = os.getenv("FINGERPRINTS_QUARTER")
 DOWNLOAD_BUCKET = os.getenv("DOWNLOAD_BUCKET")
 
