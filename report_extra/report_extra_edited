@@ -397,12 +397,14 @@ def get_download_targets_komca(report_file, previous_ids, number_tracks):
 
 def is_video_in_S3(video_id, bucket=DOWNLOAD_BUCKET, s3_resource=s3):
     try:
-        s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.m4a").load()
+        # s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.m4a").load()
+          s3_resource.Object(bucket, f"resources/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.m4a").load()
         return True
     except Exception as e:
         # could also be mp4
         try:
-            s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.mp4").load()
+            # s3_resource.Object(bucket, f"resources/private/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.mp4").load()
+              s3_resource.Object(bucket, f"resources/{PROJECT}/{FINGERPRINTS_QUARTER}/{video_id}.mp4").load()
             return True
         except Exception as e:
             return False
