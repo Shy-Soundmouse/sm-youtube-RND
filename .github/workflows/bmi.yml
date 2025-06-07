@@ -1,0 +1,107 @@
+name: Deploy BMI
+
+on:
+  workflow_dispatch:
+    inputs:
+      monster:
+        type: number
+        required: true
+        description: Which monster to use
+      quarter:
+        type: string
+        required: true
+        description: Quarter to run reporting for (e.g. 2024Q1)
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: 'true'
+        token: ${{ secrets.ORG_ACCESS_TOKEN }}
+      id: branch
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+        aws-region: us-east-1
+    - name: Set variables
+      id: vars
+      run: |
+        branch=develop
+        # Configs 
+        monster=${{ inputs.monster }}
+        quarter=${{ inputs.quarter }}
+        node=0
+        crs="true"
+        echo "MONSTER=$monster" >> "$GITHUB_OUTPUT"
+        echo "branch=$branch" >> "$GITHUB_OUTPUT"
+        echo "quarter=$quarter" >> "$GITHUB_OUTPUT"
+        echo "node=$node" >> "$GITHUB_OUTPUT"
+        echo "crs=$crs" >> "$GITHUB_OUTPUT"
+        echo Download Path is: /media/monster${monster}/bmi_download/${quarter}. Use content recognition service: ${crs}
+    - name: Setup Grafana Tanka
+      uses: unfunco/setup-tanka@1.0.0-alpha.1
+      with:
+        tanka-version: 0.31.2
+    - name: Setup kubectl and install krew
+      uses: Orfium/setup-kubectl@v1
+    - name: install-aws-cli
+      uses: unfor19/install-aws-cli-action@master
+      with:
+        version: 2.8.9
+    - name: Deploy move to monster to cluster
+      run: |
+        echo deploying to AR cluster
+        branch="${{ steps.vars.outputs.branch }}"; echo "branch: $branch";
+        ./Deployment/tanka/generate_kubeconfig.sh > kube.config;
+        export KUBECONFIG=kube.config
+        tk apply --dangerous-auto-approve  Deployment/tanka/environments/bmi/ar_cluster/ --ext-str branch=$branch --ext-str monster=${{ steps.vars.outputs.MONSTER }} --ext-str quarter=${{ steps.vars.outputs.quarter }}
+    - name: Update EKS config
+      run: |
+        aws eks update-kubeconfig --region eu-west-1 --name youtube-eks
+    - name: Deploy Poll, Extra and Download to EKS
+      run: |
+        branch="${{ steps.vars.outputs.branch }}"; echo "branch: $branch";
+        quarter="${{ steps.vars.outputs.quarter }}"; echo "quarter: $quarter";
+        crs="${{ steps.vars.outputs.crs }}"; echo "Use crs: $crs";
+        tk apply --dangerous-auto-approve Deployment/tanka/environments/bmi/eks/ --ext-str branch=$branch --ext-str quarter=$quarter --ext-code node=${{ steps.vars.outputs.node }} --ext-str crs=$crs
+
+    - name: Create Download Node
+      run: |
+        REGION=eu-west-1
+        STACK_NAME=youtube-bmi-eks-download
+        NODES=${{ steps.vars.outputs.node }}
+        TEMPLATE=Deployment/cloudformation/download.yaml
+        NODEGROUP_NAME=bmi-download
+        CLIENT=BMI
+        ./Deployment/cloudformation/download.sh ${STACK_NAME} ${TEMPLATE} ${NODEGROUP_NAME} ${NODES} ${CLIENT}
+
+    - name: Announce failure on Google Chat
+      if: ${{ failure() }}
+      run: |
+        curl --location --request POST '${{ secrets.GCHAT_GE_NOTIFICATION_WEBHOOK_URL }}' \
+        --header 'Content-Type: application/json' \
+        --data-raw '{
+            "text": "Workflow failed: ${{ github.workflow }}.\nClick to view the run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        }'
+
+    - name: Announce cancellation on Google Chat
+      if: cancelled()
+      run: |
+        curl --location --request POST '${{ secrets.GCHAT_GE_NOTIFICATION_WEBHOOK_URL }}' \
+        --header 'Content-Type: application/json' \
+        --data-raw '{
+            "text": "Workflow cancelled: ${{ github.workflow }}.\nClick to view the run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        }'
+
+    - name: Announce success on Google Chat
+      if: ${{ success() }}
+      run: |
+        curl --location --request POST '${{ secrets.GCHAT_GE_NOTIFICATION_WEBHOOK_URL }}' \
+        --header 'Content-Type: application/json' \
+        --data-raw '{
+            "text": "Workflow finished: ${{ github.workflow }}.\nClick to view the run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        }'
